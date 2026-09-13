@@ -1,0 +1,30 @@
+{
+  "name": "breath-password-merged",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "description": "呼吸即密码 · 三方整合（人1采集 + 人2匹配 + 人3界面）。行为密码，非生物识别。",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "node --test --test-isolation=none test/*.mjs",
+    "test:integration": "node test/integration.test.mjs",
+    "test:roundtrip": "node --test test/roundtrip.test.mjs",
+    "fixture:field": "node tests/make-field-fixture.mjs",
+    "fixture:health": "node tests/make-health-fixture.mjs",
+    "data:careup": "node tools/convert-careup.mjs",
+    "analyze:health": "node experiments/analyze-health.js",
+    "exp:percapita": "node experiments/percapita.js",
+    "exp:decompose": "node experiments/decompose.js",
+    "analyze": "node experiments/analyze-field.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.125.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "vite": "^7.1.2"
+  }
+}

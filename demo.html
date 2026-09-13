@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>呼吸即密码 — 音频模块调试台（人1）</title>
+<!--
+  demo.html — 音频模块的调试台
+
+  跑法：项目目录执行  python -m http.server 8000
+       然后打开      http://localhost:8000/demo.html
+
+  ★ 必须用 http://localhost，不能双击打开 ★
+  file:// 下 AudioWorklet.addModule() 一定失败（源不透明），
+  而且报出来的是一个看似无关的 AbortError，很难查。
+
+  ── 这个页面存在的三个理由 ──
+
+  1. mic.js / capture.js / recorder-worklet.js 是浏览器专用的，
+     Node 测试完全覆盖不到。而它们的失败模式全是**静默**的：
+     worklet 没连到 destination → 全零数据、零报错。
+     这个页面是这三个文件唯一的运行时验证。
+
+  2. 给队友3 当参照实现 —— 电平表、波形、门限线、周期标注怎么画，
+     直接抄下面的 drawEnvelope() 就行。
+
+  3. 现场排错。台上出问题时，这一页能立刻回答"是麦克风选错了、
+     房间太吵、还是节奏没吹对"，而不是只看到"失败"两个字。
+-->
+<style>
+  :root {
+    --bg: #12151c;
+    --panel: #1b1f29;
+    --line: #2c3240;
+    --fg: #e6e9ef;
+    --dim: #98a0b0;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --err: #f87171;
+    --accent: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 10px; color: var(--accent); }
+  .sub { color: var(--dim); margin: 0 0 20px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 14px; margin-bottom: 16px;
+  }
+  .full { grid-column: 1 / -1; }
+  button {
+    background: #2a3140; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 14px; font-size: 14px; cursor: pointer;
+    font-family: inherit; margin: 0 6px 6px 0;
+  }
+  button:hover:not(:disabled) { background: #333c4e; border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #1d4ed8; border-color: #1d4ed8; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #2563eb; }
+  select {
+    background: #2a3140; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px; font-family: inherit; font-size: 13px;
+    max-width: 100%;
+  }
+  label { display: block; margin-bottom: 6px; color: var(--dim); font-size: 13px; }
+  canvas { width: 100%; display: block; background: #0d1016; border-radius: 6px; }
+  pre {
+    background: #0d1016; border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px; overflow: auto; max-height: 320px;
+    font: 12px/1.5 "Cascadia Code", Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all; margin: 0;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; }
+  td:first-child, th:first-child { text-align: left; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+  .dim { color: var(--dim); }
+  .status { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .hint { color: var(--dim); font-size: 13px; }
+  .tag {
+    display: inline-block; background: #2a3140; border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 7px; margin: 0 4px 4px 0;
+    font-size: 12px; color: var(--warn);
+  }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 13px; }
+  .kv dt { color: var(--dim); }
+  .kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+  .note {
+    border-left: 3px solid var(--accent); padding: 8px 12px; margin: 12px 0 0;
+    background: #171b24; color: var(--dim); font-size: 13px; border-radius: 0 6px 6px 0;
+  }
+</style>
+</head>
+<body>
+
+<h1>呼吸即密码 — 音频模块调试台</h1>
+<p class="sub">
+  人1 交付物的运行时验证。<strong>必须通过 http://localhost 打开</strong>；
+  file:// 下 AudioWorklet 无法加载。
+</p>
+
+<div class="grid">
+
+  <!-- ── 环境自检 ── -->
+  <section class="panel">
+    <h2>1. 环境自检</h2>
+    <p class="hint">演示当天早上先跑这一步。它不需要麦克风权限。</p>
+    <button id="btnSelfCheck">运行自检</button>
+    <dl class="kv" id="envInfo"></dl>
+  </section>
+
+  <!-- ── 电平表 ── -->
+  <section class="panel">
+    <h2>2. 电平表（先确认麦克风是活的）</h2>
+    <p class="hint">
+      现场最尴尬的失败是吹了半天才发现选错了麦克风。
+      先看这里有没有跳动，能提前 10 秒发现。
+    </p>
+    <label for="devSel">输入设备</label>
+    <select id="devSel"><option value="">（默认设备）</option></select>
+    <div style="margin-top:10px">
+      <button id="btnMeter">启动电平表</button>
+      <button id="btnMeterStop" disabled>停止</button>
+    </div>
+    <canvas id="meterCv" height="60" style="margin-top:10px"></canvas>
+    <div class="hint" id="meterVal">—</div>
+  </section>
+
+  <!-- ── 录音 ── -->
+  <section class="panel full">
+    <h2>3. 采集一次呼吸</h2>
+    <p class="hint">
+      提示音后按自己的节奏<strong>吹 4 次</strong>（4 次吹气 → 3 个完整周期）。
+      嘴离麦克风 10~15 厘米，<strong>横向吹</strong>不要直吹（直吹会削波）。
+      最后一次吹完静音 1.2 秒会自动停止。
+    </p>
+    <button id="btnRecord" class="primary">开始录音</button>
+    <button id="btnAbort" disabled>取消</button>
+    <button id="btnFixture">用合成数据（不需要麦克风）</button>
+    <button id="btnImposter">用"他人"合成数据</button>
+    <button id="btnReanalyze" disabled>重新分析上次录音</button>
+    <button id="btnWav" disabled>导出 WAV</button>
+    <div class="status" id="phase" role="status" aria-live="polite">就绪</div>
+    <div class="hint" id="phaseHint"></div>
+  </section>
+
+  <!-- ── 波形 ── -->
+  <section class="panel full">
+    <h2>4. 包络与检测结果</h2>
+    <canvas id="envCv" height="220"></canvas>
+    <p class="hint" style="margin-top:8px">
+      <span style="color:var(--accent)">━</span> 包络
+      <span style="color:var(--err)">┅</span> 开门限 T_on
+      <span style="color:var(--warn)">┅</span> 关门限 T_off
+      <span class="dim">┅ 底噪</span>
+      <span style="color:var(--ok)">▮</span> 检出的呼气段
+    </p>
+  </section>
+
+  <!-- ── 结果 ── -->
+  <section class="panel">
+    <h2>5. 判定结果</h2>
+    <div class="status" id="resCode">—</div>
+    <div class="hint" id="resMsg"></div>
+    <div id="resFlags" style="margin-top:8px"></div>
+    <table id="cycleTbl" style="margin-top:12px"></table>
+  </section>
+
+  <!-- ── 诊断 ── -->
+  <section class="panel">
+    <h2>6. 诊断数据</h2>
+    <dl class="kv" id="diag"></dl>
+    <div class="note" id="diagNote"></div>
+  </section>
+
+  <!-- ── 交给队友2 的向量 ── -->
+  <section class="panel full">
+    <h2>7. 交给队友2 的数据</h2>
+    <p class="hint">
+      <code>durationsMs</code> 是三维序列 [吸,呼,停,…]，长度 3n-1。
+      <code>robustDurationsMs</code> 是二维基底 [呼,间隙,…]，长度 2n ——
+      它<strong>不经过吸气检测</strong>，所以跨录音一定可比。
+      DTW 之前请务必先调 <code>selectComparableVectors()</code> 决定用哪一个。
+    </p>
+    <button id="btnCopy">复制完整 JSON</button>
+    <button id="btnEnroll">存为模板（模拟注册）</button>
+    <button id="btnMatch" disabled>与模板比较（参考 DTW）</button>
+    <div id="matchOut" style="margin-top:10px"></div>
+    <pre id="jsonOut" style="margin-top:10px">（还没有结果）</pre>
+  </section>
+
+</div>
+
+<script type="module">
+import {
+  getBreathPattern, startLevelMeter, selfCheck, listInputs,
+  makeFixture, makeImposterFixture, analyzeFixture,
+  exportLastRecording, reanalyzeLast, setLogLevel,
+  selectComparableVectors, resumeContext,
+} from './src/audio/index.js';
+
+setLogLevel('debug');   // 控制台里能看到每个阶段
+
+const $ = (id) => document.getElementById(id);
+let pattern = null;     // 最近一次结果
+let template = null;    // 模拟注册的模板
+let meter = null;
+let abortCtl = null;
+
+// ═════════════════════════════════════ 1. 自检
+
+$('btnSelfCheck').onclick = async () => {
+  const r = await selfCheck();
+  const rows = [
+    ['协议', r.协议, r.协议 === 'http:' || r.协议 === 'https:'],
+    ['安全上下文', String(r.安全上下文), r.安全上下文],
+    ['环境检查', r.环境检查.ok ? '通过' : `${r.环境检查.code}`, r.环境检查.ok],
+    ['AudioWorklet', r.支持AudioWorklet ? '支持' : '不支持（将用 ScriptProcessor 兜底）', r.支持AudioWorklet],
+    ['采样率', r.采样率 ? `${r.采样率} Hz` : '未知', !!r.采样率],
+    ['上下文状态', r.上下文状态 ?? '未知', r.上下文状态 === 'running'],
+    ['输入设备数', String(r.设备列表.length), r.设备列表.length > 0],
+    ['合成兜底路径', r.合成路径?.ok ? `通过（${r.合成路径.周期数} 个周期）` : `失败 ${r.合成路径?.code ?? ''}`, !!r.合成路径?.ok],
+  ];
+  $('envInfo').innerHTML = rows
+    .map(([k, v, good]) => `<dt>${k}</dt><dd class="${good ? 'ok' : 'warn'}">${esc(v)}</dd>`)
+    .join('');
+  await fillDevices();
+};
+
+async function fillDevices() {
+  const list = await listInputs();
+  // suspicious 标记的是蓝牙免手动一类设备：它们的采样率常在 8~16kHz，
+  // 会把摩擦音频段（呼吸最亮的部分）整段砍掉。现场很容易顺手选到，
+  // 所以必须在下拉框里就标出来，而不是等录完了才报信噪比不足。
+  $('devSel').innerHTML =
+    '<option value="">（默认设备）</option>' +
+    list
+      .map(
+        (d) =>
+          `<option value="${esc(d.deviceId)}">${esc(d.label || '未命名设备')}` +
+          `${d.suspicious ? ' ⚠ 不建议（可能是蓝牙免手动，会砍掉摩擦音）' : ''}</option>`
+      )
+      .join('');
+  const bad = list.filter((d) => d.suspicious).length;
+  if (bad > 0) {
+    $('meterVal').innerHTML =
+      `<span class="warn">有 ${bad} 个设备可能不适合采集呼吸声，已在列表中标注</span>`;
+  }
+}
+
+// ═════════════════════════════════════ 2. 电平表
+
+$('btnMeter').onclick = async () => {
+  const cv = $('meterCv');
+  const ctx = cv.getContext('2d');
+  cv.width = cv.clientWidth;
+  const hist = [];
+
+  meter = await startLevelMeter(
+    (db) => {
+      hist.push(db);
+      if (hist.length > cv.width) hist.shift();
+      $('meterVal').textContent = `${db.toFixed(1)} dBFS`;
+      // 画一条滚动的电平曲线。-70..0 dBFS 映射到画布高度。
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.strokeStyle = '#4ade80';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      hist.forEach((v, i) => {
+        const y = cv.height * (1 - (Math.max(-70, Math.min(0, v)) + 70) / 70);
+        i ? ctx.lineTo(i, y) : ctx.moveTo(i, y);
+      });
+      ctx.stroke();
+    },
+    { deviceId: $('devSel').value || undefined }
+  );
+
+  if (!meter.ok) {
+    $('meterVal').innerHTML = `<span class="err">${esc(meter.message)}</span><br>${esc(meter.hint ?? '')}`;
+    return;
+  }
+  $('meterVal').textContent = `已启动：${meter.deviceLabel || '（未知设备）'}`;
+  $('btnMeter').disabled = true;
+  $('btnMeterStop').disabled = false;
+};
+
+$('btnMeterStop').onclick = () => {
+  meter?.stop();
+  meter = null;
+  $('btnMeter').disabled = false;
+  $('btnMeterStop').disabled = true;
+};
+
+// ═════════════════════════════════════ 3. 录音
+
+$('btnRecord').onclick = async () => {
+  // 电平表和录音不能同时占着麦克风
+  if (meter) $('btnMeterStop').click();
+
+  // ★ 在手势的调用栈里同步启动音频上下文。
+  //   浏览器要求 resume() 发生在用户手势里 —— 这一行是有意放在
+  //   任何 await 之前的，不要挪走。
+  resumeContext();
+
+  abortCtl = new AbortController();
+  $('btnRecord').disabled = true;
+  $('btnAbort').disabled = false;
+  clearResult();
+
+  const p = await getBreathPattern({
+    deviceId: $('devSel').value || undefined,
+    signal: abortCtl.signal,
+    onPhase: ({ phase, message }) => {
+      $('phase').textContent = message;
+      $('phase').className = 'status ' + (phase === 'done' ? 'ok' : '');
+    },
+    onLevel: (db) => { $('meterVal').textContent = `${db.toFixed(1)} dBFS`; },
+  });
+
+  $('btnRecord').disabled = false;
+  $('btnAbort').disabled = true;
+  $('btnWav').disabled = false;
+  $('btnReanalyze').disabled = false;
+  show(p);
+};
+
+$('btnAbort').onclick = () => abortCtl?.abort();
+
+$('btnFixture').onclick = () => {
+  $('phase').textContent = '已分析合成数据（本人节奏）';
+  show(analyzeFixture(makeFixture('alice', Math.floor(Math.random() * 1000))));
+};
+
+$('btnImposter').onclick = () => {
+  $('phase').textContent = '已分析合成数据（他人节奏 —— DTW 应判 FAIL）';
+  show(analyzeFixture(makeImposterFixture('alice', Math.floor(Math.random() * 1000))));
+};
+
+$('btnReanalyze').onclick = () => {
+  const p = reanalyzeLast();
+  if (!p) { $('phase').textContent = '还没有录音可重新分析'; return; }
+  $('phase').textContent = '已重新分析上次录音';
+  show(p);
+};
+
+$('btnWav').onclick = () => {
+  const url = exportLastRecording();
+  if (!url) { $('phase').textContent = '还没有录音可导出'; return; }
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `breath-${Date.now()}.wav`;
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+// ═════════════════════════════════════ 4. 画包络
+//
+// 队友3 可以直接抄这个函数。要点：
+//  · meta.envelopeDb 是 240 点降采样包络，直接当 y 序列用
+//  · meta.thresholds 是 [T_on, T_off]，画成横线
+//  · cycles[i].startMs / meta.recordingMs 换算出 x，标出每个周期
+// 纵轴范围取 [底噪-8, 峰值+4]，让波形填满画布而不是挤在中间一条。
+
+function drawEnvelope(p) {
+  const cv = $('envCv');
+  cv.width = cv.clientWidth;
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const env = p.meta.envelopeDb;
+  if (!env || env.length === 0) {
+    ctx.fillStyle = '#98a0b0';
+    ctx.font = '13px sans-serif';
+    ctx.fillText('没有包络数据', 12, H / 2);
+    return;
+  }
+
+  const lo = Math.min(...env) - 8;
+  const hi = Math.max(...env) + 4;
+  const y = (db) => H * (1 - (Math.max(lo, Math.min(hi, db)) - lo) / (hi - lo));
+  const x = (ms) => (ms / Math.max(1, p.meta.recordingMs)) * W;
+
+  // 检出的呼气段（先画，当背景）
+  ctx.fillStyle = 'rgba(74,222,128,.14)';
+  for (const c of p.cycles) {
+    ctx.fillRect(x(c.startMs), 0, Math.max(1, x(c.startMs + c.cycleMs) - x(c.startMs)), H);
+  }
+
+  // 门限线与底噪线
+  const lines = [
+    [p.meta.thresholds[0], '#f87171', 'T_on'],
+    [p.meta.thresholds[1], '#fbbf24', 'T_off'],
+    [p.meta.floorDbfs, '#98a0b0', '底噪'],
+  ];
+  ctx.setLineDash([5, 4]);
+  ctx.font = '11px sans-serif';
+  for (const [db, color, label] of lines) {
+    if (db == null || !Number.isFinite(db)) continue;
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y(db)); ctx.lineTo(W, y(db)); ctx.stroke();
+    ctx.fillText(`${label} ${db.toFixed(1)}`, 4, y(db) - 3);
+  }
+  ctx.setLineDash([]);
+
+  // 包络本体
+  ctx.strokeStyle = '#60a5fa'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  env.forEach((db, i) => {
+    const px = (i / (env.length - 1)) * W;
+    i ? ctx.lineTo(px, y(db)) : ctx.moveTo(px, y(db));
+  });
+  ctx.stroke();
+
+  // 周期序号
+  ctx.fillStyle = '#e6e9ef'; ctx.font = '12px sans-serif';
+  p.cycles.forEach((c, i) => ctx.fillText(`#${i + 1}`, x(c.startMs) + 3, 14));
+}
+
+// ═════════════════════════════════════ 5~7. 结果展示
+
+function show(p) {
+  pattern = p;
+  $('phaseHint').textContent = p.hint || '';
+  $('resCode').textContent = p.ok ? `通过 — ${p.code}` : `未通过 — ${p.code}`;
+  $('resCode').className = 'status ' + (p.ok ? 'ok' : 'err');
+  $('resMsg').textContent = p.message;
+
+  $('resFlags').innerHTML = p.meta.flags.length
+    ? p.meta.flags.map((f) => `<span class="tag">${esc(f)}</span>`).join('')
+    : '<span class="dim">无警告标记</span>';
+
+  // 周期表
+  $('cycleTbl').innerHTML = p.cycles.length
+    ? `<tr><th>周期</th><th>吸气</th><th>呼气</th><th>停顿</th><th>间隙</th><th>起点</th></tr>` +
+      p.cycles.map((c, i) =>
+        `<tr><td>#${i + 1}</td><td>${c.inhale}</td><td>${c.exhale}</td>` +
+        `<td>${c.pause}</td><td>${c.gapMs}</td><td>${c.startMs}</td></tr>`
+      ).join('')
+    : '<tr><td class="dim">没有检出完整周期</td></tr>';
+
+  // 诊断
+  const m = p.meta;
+  const crestCls = m.crest == null ? 'dim' : m.crest < 2.2 ? 'err' : m.crest < 2.65 ? 'warn' : 'ok';
+  const snrCls = m.snrDb == null ? 'dim' : m.snrDb >= 12 ? 'ok' : m.snrDb >= 8 ? 'warn' : 'err';
+  $('diag').innerHTML = [
+    ['采集方式', m.capKind, 'dim'],
+    ['设备', m.deviceLabel || '（未知）', 'dim'],
+    ['采样率', `${m.sampleRate} Hz`, 'dim'],
+    ['录音长度', `${m.recordingMs} ms`, 'dim'],
+    ['底噪', fmt(m.floorDbfs, 'dBFS'), m.floorDbfs != null && m.floorDbfs > -25 ? 'warn' : 'ok'],
+    ['信噪比', fmt(m.snrDb, 'dB'), snrCls],
+    ['波峰因数', m.crest == null ? '—' : m.crest.toFixed(2), crestCls],
+    ['削波占比', `${(m.clipRatio * 100).toFixed(3)}%`, m.clipRatio > 0.005 ? 'err' : 'ok'],
+    ['呼气段削波', `${(m.activeClipRatio * 100).toFixed(3)}%`, m.activeClipRatio > 0.02 ? 'err' : 'ok'],
+    ['边界误差 σ', fmt(m.boundarySigmaMs, 'ms'), 'dim'],
+    ['吸气检出', m.inhaleDetected ? '有（三维可用）' : '无（退到二维基底）', m.inhaleDetected ? 'ok' : 'warn'],
+    ['AGC 已关闭', m.agcVerified === true ? '已确认' : m.agcVerified === false ? '仍开着' : '无法核实',
+      m.agcVerified === true ? 'ok' : 'warn'],
+  ].map(([k, v, cls]) => `<dt>${k}</dt><dd class="${cls}">${esc(v)}</dd>`).join('');
+
+  // 诊断提示 —— 把数字翻译成"下一步该做什么"
+  $('diagNote').textContent = advise(p);
+
+  drawEnvelope(p);
+  $('jsonOut').textContent = JSON.stringify(p, null, 2);
+  $('btnMatch').disabled = !(template && p.ok);
+}
+
+/** 把诊断数字翻译成一句可执行的建议。现场排错时这句最有用。 */
+function advise(p) {
+  const m = p.meta;
+  if (m.capKind === 'fixture' || m.capKind === 'synth') return '这是合成数据，不反映现场麦克风状况。';
+  if (m.crest != null && m.crest < 2.2) return '波峰因数过低 = 波形已被压平。调低系统麦克风音量，或改成横向吹气并离远一点。';
+  if (m.crest != null && m.crest < 2.65) return '接近削波了。建议把系统麦克风音量降一档。';
+  if (m.floorDbfs != null && m.floorDbfs > -25) return '底噪很高。换个安静位置，或关掉风扇/投影仪。';
+  if (m.snrDb != null && m.snrDb < 8) return '呼吸没有明显高出底噪。靠近麦克风、加大力度。';
+  if (!m.inhaleDetected) return '吸气太轻没测到，已退到二维匹配（仍然可用）。想用三维就吸气时吸得响一点。';
+  if (m.agcVerified !== true) return '无法确认浏览器的自动增益已关闭。到系统声音设置里手动关掉"自动调整麦克风音量"。';
+  return '信号质量良好。';
+}
+
+// ═════════════════════════════════════ 模板与参考 DTW
+
+$('btnEnroll').onclick = () => {
+  if (!pattern?.ok) { $('matchOut').innerHTML = '<span class="err">当前没有合格的结果可存为模板</span>'; return; }
+  template = pattern;
+  $('btnMatch').disabled = false;
+  $('matchOut').innerHTML = `<span class="ok">已存为模板</span>
+    <span class="dim">（${template.cycleCount} 个周期，吸气${template.meta.inhaleDetected ? '有' : '无'}）</span>`;
+};
+
+$('btnMatch').onclick = () => {
+  if (!template || !pattern) return;
+
+  // ★ 关键：先让本模块决定用哪一对向量，不要直接抓 durationsMs。
+  //   两次录音的吸气检出情况可能不同，直接比三维会让本人被误拒。
+  const v = selectComparableVectors(template, pattern);
+  if (!v.ok) {
+    $('matchOut').innerHTML = `<span class="err">无法比较：${esc(v.reason)}</span>`;
+    return;
+  }
+  const d = dtw(v.a, v.b);
+  $('matchOut').innerHTML = `
+    <div>模式：<strong>${v.mode === 'full' ? '三维 [吸,呼,停]' : '二维 [呼,间隙]'}</strong>
+      <span class="dim">${esc(v.reason)}</span></div>
+    <div style="margin-top:4px">参考 DTW 距离：<strong>${d.toFixed(1)}</strong></div>
+    <div class="hint">
+      这只是核验素材用的参考实现，阈值由队友2 校准。
+      注意<strong>两种模式不在同一量纲上</strong>（二维装的是间隙，数值大得多），
+      必须各自校准一个阈值。
+    </div>`;
+};
+
+/** 参考 DTW —— 仅用于本页自检，交付实现由队友2 负责。 */
+function dtw(a, b) {
+  const n = a.length, m = b.length;
+  if (!n || !m) return Infinity;
+  let prev = new Float64Array(m + 1).fill(Infinity);
+  let cur = new Float64Array(m + 1).fill(Infinity);
+  prev[0] = 0;
+  for (let i = 1; i <= n; i++) {
+    cur.fill(Infinity);
+    for (let j = 1; j <= m; j++) {
+      cur[j] = Math.abs(a[i - 1] - b[j - 1]) + Math.min(prev[j], cur[j - 1], prev[j - 1]);
+    }
+    [prev, cur] = [cur, prev];
+  }
+  return prev[m] / (n + m);
+}
+
+$('btnCopy').onclick = async () => {
+  if (!pattern) return;
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(pattern, null, 2));
+    $('btnCopy').textContent = '已复制 ✓';
+    setTimeout(() => ($('btnCopy').textContent = '复制完整 JSON'), 1500);
+  } catch {
+    $('btnCopy').textContent = '复制失败，请手动选中下方文本';
+  }
+};
+
+// ═════════════════════════════════════ 杂项
+
+function clearResult() {
+  $('resCode').textContent = '—';
+  $('resCode').className = 'status';
+  $('resMsg').textContent = '';
+  $('resFlags').innerHTML = '';
+  $('cycleTbl').innerHTML = '';
+  $('diag').innerHTML = '';
+  $('diagNote').textContent = '';
+  $('jsonOut').textContent = '（录音中…）';
+}
+
+const fmt = (v, unit) => (v == null || !Number.isFinite(v) ? '—' : `${v} ${unit}`);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// ═════════════════════════════════════ 现场调试用的全局入口
+//
+// 台上出问题时，按钮不一定够用 —— 需要在控制台里直接调。
+// 这是**有意**挂到 window 上的，不是忘了清理：
+//   breath.exportLastRecording()   导出刚才那段 WAV，离线复现问题
+//   breath.reanalyzeLast()         改了参数不用重新吹
+//   breath.setLogLevel('debug')    看每个阶段
+//   breath.pattern                 最近一次完整结果
+// docs/HANDOFF.md 的"出问题时"一节引用了这几个名字，改动请同步那里。
+window.breath = {
+  getBreathPattern, startLevelMeter, selfCheck, listInputs,
+  makeFixture, makeImposterFixture, analyzeFixture,
+  exportLastRecording, reanalyzeLast, setLogLevel,
+  selectComparableVectors,
+  get pattern() { return pattern; },
+  get template() { return template; },
+};
+
+// 打开就跑一次自检 —— 环境问题要在按录音之前就暴露出来
+$('btnSelfCheck').click();
+</script>
+</body>
+</html>
